@@ -113,7 +113,12 @@ class ScreeningView extends Croquet.View {
       this.publish(this.sessionId, 'play-video');
     }, options);
     pause.addEventListener('click', () => this.publish(this.sessionId, 'pause-video'), options);
-    sync.addEventListener('click', () => this.applyPlayback(), options);
+    sync.addEventListener('click', () => {
+      if (!this.ready) return;
+      this.player.unMute();
+      this.applyPlayback(true);
+    }, options);
+    this.driftTimer = setInterval(() => this.correctDrift(), 1000);
     this.subscribe(model.id, 'updated', this.render);
     load.disabled = false;
     this.render();
@@ -131,6 +136,8 @@ class ScreeningView extends Croquet.View {
     }
     this.video = video;
     this.ready = false;
+    this.blocked = false;
+    this.triedMuted = false;
     play.disabled = pause.disabled = sync.disabled = true;
     this.player?.destroy();
     this.player = null;
@@ -139,7 +146,7 @@ class ScreeningView extends Croquet.View {
     frame.title = 'Shared YouTube video';
     frame.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
     frame.allowFullscreen = true;
-    const params = new URLSearchParams({enablejsapi: '1', origin: location.origin, playsinline: '1', rel: '0'});
+    const params = new URLSearchParams({enablejsapi: '1', origin: location.origin, playsinline: '1', controls: '0', rel: '0'});
     frame.src = 'https://www.youtube.com/embed/' + video + '?' + params;
     stage.replaceChildren(frame);
     loadYouTube().then(() => {
@@ -154,25 +161,59 @@ class ScreeningView extends Croquet.View {
         onError: () => {
           status.textContent = 'This video is unavailable here. Try another embeddable video.';
         },
+        onStateChange: event => {
+          if (event.data !== YT.PlayerState.PLAYING) return;
+          this.blocked = false;
+          if (this.screening.isPlaying) this.correctDrift();
+          status.textContent = this.screening.isPlaying && this.player.isMuted()
+            ? 'Playing muted · tap Sync my player for sound'
+            : this.screening.isPlaying ? 'Playing for room' : 'Playing locally · use Play for room to share';
+        },
         onAutoplayBlocked: () => {
-          if (this.screening.isPlaying) status.textContent = 'Tap Sync my player to join playback.';
+          if (!this.screening.isPlaying) return;
+          if (!this.triedMuted) {
+            this.triedMuted = true;
+            this.player.mute();
+            this.applyPlayback(true);
+          } else {
+            this.blocked = true;
+            status.textContent = 'Tap Sync my player to join playback.';
+          }
         }
       }});
     }).catch(() => {
       if (this.video === video) status.textContent = 'YouTube could not load in this browser.';
     });
   }
-  applyPlayback() {
-    if (!this.ready) return;
+  roomPosition() {
     const state = this.screening;
-    const elapsed = state.isPlaying ? Math.max(0, this.extrapolatedNow() - state.changedAt) / 1000 : 0;
-    const position = state.position + elapsed;
-    if (Math.abs(this.player.getCurrentTime() - position) > 1.25) this.player.seekTo(position, true);
-    if (state.isPlaying) this.player.playVideo();
-    else this.player.pauseVideo();
-    status.textContent = state.isPlaying ? 'Playing for room' : 'Paused for room';
+    const clock = this.extrapolatedNow();
+    const elapsed = state.isPlaying && Number.isFinite(clock) ? Math.max(0, clock - state.changedAt) / 1000 : 0;
+    const duration = this.player.getDuration();
+    const target = state.position + elapsed;
+    return duration > 0 ? Math.min(duration, target) : target;
+  }
+  correctDrift() {
+    if (!this.ready || this.blocked || !this.screening.isPlaying ||
+        this.player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+    const target = this.roomPosition();
+    if (Math.abs(this.player.getCurrentTime() - target) > 1) this.player.seekTo(target, true);
+  }
+  applyPlayback(forceSeek = false) {
+    if (!this.ready) return;
+    this.blocked = false;
+    const target = this.roomPosition();
+    if (forceSeek || Math.abs(this.player.getCurrentTime() - target) > .75) this.player.seekTo(target, true);
+    if (this.screening.isPlaying) {
+      this.player.playVideo();
+      status.textContent = this.player.isMuted() ? 'Playing muted · tap Sync my player for sound' : 'Playing for room';
+    } else {
+      this.player.pauseVideo();
+      status.textContent = 'Paused for room';
+    }
   }
   detach() {
+    clearInterval(this.driftTimer);
     this.abort.abort();
     this.player?.destroy();
     super.detach();
