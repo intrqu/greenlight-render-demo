@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>YouTube · Greenlight</title>
+<style>
+*{box-sizing:border-box}body{margin:0;height:100dvh;display:flex;flex-direction:column;background:#f4f6f5;color:#182622;font:14px system-ui}header,form,.controls{display:flex;align-items:center;gap:.45rem;flex-wrap:wrap}header{padding:.55rem;background:white;border-bottom:1px solid #b9c6c0}form{flex:1;min-width:14rem}input{flex:1;min-width:8rem}input,button{font:inherit;border:1px solid #84958e;border-radius:.3rem;padding:.35rem .5rem;background:white;color:inherit}button:disabled{opacity:.5}button:focus-visible,input:focus-visible{outline:2px solid #067a52;outline-offset:2px}.controls{padding:.45rem .55rem}main{flex:1;min-height:0;display:grid;place-items:center;background:#101312;color:white;text-align:center}iframe{width:100%;height:100%;border:0}#status{margin-inline-start:auto}
+</style>
+<header><strong>YouTube</strong>
+<form id="video-form"><input id="video-input" aria-label="YouTube video link" placeholder="Paste a YouTube link" required><button disabled>Load for room</button></form>
+</header>
+<div class="controls">
+<button id="play" disabled>Play for room</button>
+<button id="pause" disabled>Pause for room</button>
+<button id="sync" disabled>Sync my player</button>
+<span id="status" role="status">Connecting…</span>
+</div>
+<main id="stage"><p>Load an embeddable YouTube video to watch together.</p></main>
+<script src="/croquet/croquet.min.js"></script>
+<script type="module">
+const room = new URL(location.href).searchParams.get('q');
+const form = document.querySelector('#video-form');
+const input = document.querySelector('#video-input');
+const load = form.querySelector('button');
+const play = document.querySelector('#play');
+const pause = document.querySelector('#pause');
+const sync = document.querySelector('#sync');
+const stage = document.querySelector('#stage');
+const status = document.querySelector('#status');
+const validId = /^[A-Za-z0-9_-]{11}$/;
+
+function videoId(value) {
+  const candidate = value.trim();
+  if (validId.test(candidate)) return candidate;
+  try {
+    const url = new URL(candidate);
+    if (!['https:', 'http:'].includes(url.protocol)) return null;
+    if (url.hostname === 'youtu.be') return url.pathname.split('/')[1];
+    if (['youtube.com', 'www.youtube.com', 'm.youtube.com', 'www.youtube-nocookie.com'].includes(url.hostname)) {
+      const [, kind, id] = url.pathname.split('/');
+      return kind === 'watch' ? url.searchParams.get('v') : ['embed', 'shorts', 'live'].includes(kind) ? id : null;
+    }
+  } catch { return null; }
+  return null;
+}
+
+class Screening extends Croquet.Model {
+  init() {
+    this.video = '';
+    this.isPlaying = false;
+    this.position = 0;
+    this.changedAt = 0;
+    this.subscribe(this.sessionId, 'load-video', this.loadVideo);
+    this.subscribe(this.sessionId, 'play-video', this.playVideo);
+    this.subscribe(this.sessionId, 'pause-video', this.pauseVideo);
+  }
+  loadVideo(id) {
+    if (typeof id !== 'string' || !validId.test(id)) return;
+    this.video = id;
+    this.isPlaying = false;
+    this.position = 0;
+    this.publish(this.id, 'updated');
+  }
+  playVideo() {
+    if (!this.video || this.isPlaying) return;
+    this.changedAt = this.now();
+    this.isPlaying = true;
+    this.publish(this.id, 'updated');
+  }
+  pauseVideo() {
+    if (!this.isPlaying) return;
+    this.position += Math.max(0, this.now() - this.changedAt) / 1000;
+    this.isPlaying = false;
+    this.publish(this.id, 'updated');
+  }
+}
+Screening.register('GreenlightYouTubeScreening');
+
+let apiPromise;
+function loadYouTube() {
+  if (window.YT?.Player) return Promise.resolve();
+  if (!apiPromise) {
+    apiPromise = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('YouTube timed out.')), 12000);
+      window.onYouTubeIframeAPIReady = () => { clearTimeout(timeout); resolve(); };
+      const script = document.createElement('script');
+      script.src = 'https://www.youtube.com/iframe_api';
+      script.onerror = () => { clearTimeout(timeout); reject(new Error('YouTube could not be loaded.')); };
+      document.head.append(script);
+    });
+  }
+  return apiPromise;
+}
+
+class ScreeningView extends Croquet.View {
+  constructor(model) {
+    super(model);
+    this.screening = model;
+    this.abort = new AbortController();
+    const options = {signal: this.abort.signal};
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const id = videoId(input.value);
+      if (!id || !validId.test(id)) {
+        status.textContent = 'Enter a valid YouTube video link.';
+        return;
+      }
+      this.publish(this.sessionId, 'load-video', id);
+    }, options);
+    play.addEventListener('click', () => {
+      if (this.ready) this.player.playVideo();
+      this.publish(this.sessionId, 'play-video');
+    }, options);
+    pause.addEventListener('click', () => this.publish(this.sessionId, 'pause-video'), options);
+    sync.addEventListener('click', () => {
+      if (!this.ready) return;
+      this.player.unMute();
+      this.applyPlayback(true);
+    }, options);
+    this.driftTimer = setInterval(() => this.correctDrift(), 1000);
+    this.subscribe(model.id, 'updated', this.render);
+    load.disabled = false;
+    this.render();
+  }
+  render() {
+    const video = this.screening.video;
+    play.disabled = pause.disabled = sync.disabled = !this.ready;
+    if (!video) {
+      status.textContent = 'Room connected';
+      return;
+    }
+    if (this.video === video) {
+      if (this.ready) this.applyPlayback();
+      return;
+    }
+    this.video = video;
+    this.ready = false;
+    this.blocked = false;
+    this.triedMuted = false;
+    play.disabled = pause.disabled = sync.disabled = true;
+    this.player?.destroy();
+    this.player = null;
+    status.textContent = 'Loading video…';
+    const frame = document.createElement('iframe');
+    frame.title = 'Shared YouTube video';
+    frame.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
+    frame.allowFullscreen = true;
+    const params = new URLSearchParams({enablejsapi: '1', origin: location.origin, playsinline: '1', controls: '0', rel: '0'});
+    frame.src = 'https://www.youtube.com/embed/' + video + '?' + params;
+    stage.replaceChildren(frame);
+    loadYouTube().then(() => {
+      if (this.abort.signal.aborted || this.video !== video) return;
+      this.player = new YT.Player(frame, {events: {
+        onReady: () => {
+          if (this.video !== video) return;
+          this.ready = true;
+          play.disabled = pause.disabled = sync.disabled = false;
+          this.applyPlayback();
+        },
+        onError: () => {
+          status.textContent = 'This video is unavailable here. Try another embeddable video.';
+        },
+        onStateChange: event => {
+          if (event.data !== YT.PlayerState.PLAYING) return;
+          this.blocked = false;
+          if (this.screening.isPlaying) this.correctDrift();
+          status.textContent = this.screening.isPlaying && this.player.isMuted()
+            ? 'Playing muted · tap Sync my player for sound'
+            : this.screening.isPlaying ? 'Playing for room' : 'Playing locally · use Play for room to share';
+        },
+        onAutoplayBlocked: () => {
+          if (!this.screening.isPlaying) return;
+          if (!this.triedMuted) {
+            this.triedMuted = true;
+            this.player.mute();
+            this.applyPlayback(true);
+          } else {
+            this.blocked = true;
+            status.textContent = 'Tap Sync my player to join playback.';
+          }
+        }
+      }});
+    }).catch(() => {
+      if (this.video === video) status.textContent = 'YouTube could not load in this browser.';
+    });
+  }
+  roomPosition() {
+    const state = this.screening;
+    const clock = this.extrapolatedNow();
+    const elapsed = state.isPlaying && Number.isFinite(clock) ? Math.max(0, clock - state.changedAt) / 1000 : 0;
+    const duration = this.player.getDuration();
+    const target = state.position + elapsed;
+    return duration > 0 ? Math.min(duration, target) : target;
+  }
+  correctDrift() {
+    if (!this.ready || this.blocked || !this.screening.isPlaying ||
+        this.player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+    const target = this.roomPosition();
+    if (Math.abs(this.player.getCurrentTime() - target) > 1) this.player.seekTo(target, true);
+  }
+  applyPlayback(forceSeek = false) {
+    if (!this.ready) return;
+    this.blocked = false;
+    const target = this.roomPosition();
+    if (forceSeek || Math.abs(this.player.getCurrentTime() - target) > .75) this.player.seekTo(target, true);
+    if (this.screening.isPlaying) {
+      this.player.playVideo();
+      status.textContent = this.player.isMuted() ? 'Playing muted · tap Sync my player for sound' : 'Playing for room';
+    } else {
+      this.player.pauseVideo();
+      status.textContent = 'Paused for room';
+    }
+  }
+  detach() {
+    clearInterval(this.driftTimer);
+    this.abort.abort();
+    this.player?.destroy();
+    super.detach();
+  }
+}
+
+if (room && /^[\w-]{1,100}$/.test(room)) {
+  Croquet.Session.join({
+    box: '/', appId: 'com.hellojevans.greenlight.youtube',
+    name: room, password: room, model: Screening, view: ScreeningView, tps: 10
+  }).catch(() => { status.textContent = 'Could not connect. Reopen this tool to retry.'; });
+} else {
+  status.textContent = 'Open YouTube from a Greenlight room.';
+}
+</script>
+</html>
