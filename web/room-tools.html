@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Greenlight room tool</title>
+<style>
+*{box-sizing:border-box}body{margin:0;height:100dvh;display:flex;flex-direction:column;background:#f4f6f5;color:#182622;font:14px system-ui}header{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;padding:.55rem;border-bottom:1px solid #b9c6c0;background:white}button,input{font:inherit}button{padding:.35rem .65rem;background:white;color:inherit;border:1px solid #84958e;border-radius:.3rem}button:disabled{opacity:.5}button:focus-visible,input:focus-visible{outline:2px solid #067a52;outline-offset:2px}main{position:relative;flex:1;min-height:0;display:grid;place-items:center;overflow:hidden}canvas{width:100%;height:100%;display:block;background:white;touch-action:none}img{width:100%;height:100%;object-fit:contain;min-height:0}.status{margin-inline-start:auto}
+img{display:block;max-height:100%}main[data-drop]{outline:3px dashed #067a52;outline-offset:-5px;background:#e0f3e9}main[data-drop] img{opacity:.55}
+</style>
+<header id="toolbar" aria-label="Room tool controls"><strong id="title"></strong><span id="status" class="status" role="status">Connecting…</span></header>
+<main id="stage"></main>
+<script src="/croquet/croquet.min.js"></script>
+<script type="module">
+const url = new URL(location.href);
+const room = url.searchParams.get('q');
+const pictures = url.pathname.startsWith('/pix');
+const photos = [
+  ['greenlight-1.png', 'Greenlight shared workspace'],
+  ['greenlight-2.png', 'Greenlight collaboration interface'],
+  ['greenlight-3.png', 'Greenlight project screenshot']
+];
+const imageTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'];
+const maxImageBytes = 10 * 1024 * 1024;
+const colors = ['#17392e', '#047857', '#b42318', '#1d4ed8'];
+const status = document.querySelector('#status');
+const toolbar = document.querySelector('#toolbar');
+const title = document.querySelector('#title');
+const stage = document.querySelector('#stage');
+title.textContent = pictures ? 'Pictures' : 'Whiteboard';
+document.title = title.textContent + ' · Greenlight';
+
+class ToolModel extends Croquet.Model {
+  init() {
+    this.segments = [];
+    this.photo = 0;
+    this.subscribe(this.sessionId, 'draw', this.draw);
+    this.subscribe(this.sessionId, 'clear', this.clear);
+    this.subscribe(this.sessionId, 'page', this.page);
+    this.subscribe(this.sessionId, 'add-photo', this.addPhoto);
+  }
+  draw(segments) {
+    if (!Array.isArray(segments) || segments.length > 128) return;
+    const valid = segments.filter(s => Array.isArray(s) && s.length === 5 &&
+      s.slice(0, 4).every(n => Number.isFinite(n) && n >= 0 && n <= 1) && colors.includes(s[4]));
+    if (!valid.length) return;
+    this.segments.push(...valid);
+    if (this.segments.length > 12000) this.segments.splice(0, this.segments.length - 12000);
+    this.publish(this.id, 'changed');
+  }
+  clear() {
+    this.segments = [];
+    this.publish(this.id, 'changed');
+  }
+  page(delta) {
+    if (delta !== -1 && delta !== 1) return;
+    const count = photos.length + (this.uploads?.length ?? 0);
+    this.photo = (this.photo + delta + count) % count;
+    this.publish(this.id, 'changed');
+  }
+  addPhoto(entry) {
+    if (!entry || !imageTypes.includes(entry.type) ||
+        typeof entry.id !== 'string' || !entry.id || entry.id.length > 512 ||
+        typeof entry.name !== 'string' || entry.name.length > 120) return;
+    this.uploads ??= [];
+    if (this.uploads.some(photo => photo.id === entry.id)) return;
+    this.uploads.push(entry);
+    this.photo = photos.length + this.uploads.length - 1;
+    this.publish(this.id, 'changed');
+  }
+}
+ToolModel.register('GreenlightPortfolioTool');
+
+class ToolView extends Croquet.View {
+  constructor(model) {
+    super(model);
+    this.model = model;
+    this.cleanup = new AbortController();
+    this.pending = [];
+    status.textContent = 'Shared live';
+    if (pictures) this.mountGallery();
+    else this.mountBoard();
+    this.subscribe(model.id, 'changed', this.render);
+    this.render();
+  }
+  button(label, action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.addEventListener('click', action, {signal: this.cleanup.signal});
+    toolbar.insertBefore(button, status);
+  }
+  mountGallery() {
+    this.image = document.createElement('img');
+    this.image.draggable = false;
+    stage.replaceChildren(this.image);
+    this.button('Previous', () => this.publish(this.sessionId, 'page', -1));
+    this.button('Next', () => this.publish(this.sessionId, 'page', 1));
+    const picker = document.createElement('input');
+    picker.type = 'file';
+    picker.accept = imageTypes.join(',');
+    picker.multiple = true;
+    picker.hidden = true;
+    toolbar.append(picker);
+    this.button('Add pictures', () => picker.click());
+    const options = {signal: this.cleanup.signal};
+    picker.addEventListener('change', () => {
+      this.uploadPictures(Array.from(picker.files));
+      picker.value = '';
+    }, options);
+    stage.addEventListener('dragover', event => {
+      if (!event.dataTransfer.types.includes('Files')) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      stage.dataset.drop = '';
+    }, options);
+    stage.addEventListener('dragleave', event => {
+      if (!stage.contains(event.relatedTarget)) delete stage.dataset.drop;
+    }, options);
+    stage.addEventListener('drop', event => {
+      if (!event.dataTransfer.types.includes('Files')) return;
+      event.preventDefault();
+      delete stage.dataset.drop;
+      this.uploadPictures(Array.from(event.dataTransfer.files));
+    }, options);
+  }
+  async uploadPictures(files) {
+    if (this.uploading) return;
+    this.uploading = true;
+    let skipped = 0;
+    for (const file of files) {
+      if (!imageTypes.includes(file.type) || !file.size || file.size > maxImageBytes) {
+        skipped++;
+        continue;
+      }
+      status.textContent = 'Adding pictures…';
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const handle = await Croquet.Data.store(this.sessionId, bytes);
+        if (this.cleanup.signal.aborted) return;
+        this.publish(this.sessionId, 'add-photo', {
+          id: Croquet.Data.toId(handle), type: file.type, name: file.name.slice(0, 120)
+        });
+      } catch (error) {
+        skipped++;
+        console.error('Could not add picture', error);
+      }
+    }
+    this.uploading = false;
+    this.render();
+    if (skipped) status.textContent = `${skipped} skipped. Use an image up to 10 MB.`;
+  }
+  async showUploadedPhoto(entry) {
+    try {
+      const bytes = await Croquet.Data.fetch(this.sessionId, Croquet.Data.fromId(entry.id));
+      if (this.cleanup.signal.aborted || this.displayedPhoto !== entry.id) return;
+      this.imageUrl = URL.createObjectURL(new Blob([bytes], {type: entry.type}));
+      this.image.src = this.imageUrl;
+    } catch (error) {
+      if (!this.cleanup.signal.aborted && this.displayedPhoto === entry.id) {
+        status.textContent = 'Picture could not load.';
+      }
+      console.error(error);
+    }
+  }
+  mountBoard() {
+    const canvas = this.canvas = document.createElement('canvas');
+    canvas.setAttribute('aria-label', 'Shared whiteboard drawing surface');
+    stage.replaceChildren(canvas);
+    const color = document.createElement('select');
+    color.setAttribute('aria-label', 'Ink color');
+    ['Charcoal', 'Green', 'Red', 'Blue'].forEach((name, i) => color.add(new Option(name, colors[i])));
+    toolbar.insertBefore(color, status);
+    this.button('Clear board', () => { this.flush(); this.publish(this.sessionId, 'clear'); });
+    const options = {signal: this.cleanup.signal};
+    const point = event => {
+      const bounds = canvas.getBoundingClientRect();
+      return [
+        Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+        Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height))
+      ];
+    };
+    const add = (from, to) => {
+      const segment = [...from, ...to, color.value];
+      this.pending.push(segment);
+      this.paint(segment);
+      if (this.pending.length >= 128) this.flush();
+    };
+    canvas.addEventListener('pointerdown', event => {
+      if (this.pointer !== undefined || event.button !== 0) return;
+      this.pointer = event.pointerId;
+      canvas.setPointerCapture(event.pointerId);
+      this.last = point(event);
+      add(this.last, this.last);
+    }, options);
+    canvas.addEventListener('pointermove', event => {
+      if (this.pointer !== event.pointerId) return;
+      const next = point(event);
+      add(this.last, next);
+      this.last = next;
+    }, options);
+    const end = event => {
+      if (this.pointer !== event.pointerId) return;
+      this.pointer = undefined;
+      this.flush();
+    };
+    canvas.addEventListener('pointerup', end, options);
+    canvas.addEventListener('pointercancel', end, options);
+    canvas.addEventListener('lostpointercapture', end, options);
+    this.timer = setInterval(() => this.flush(), 45);
+    this.observer = new ResizeObserver(() => this.render());
+    this.observer.observe(stage);
+  }
+  flush() {
+    if (!this.pending.length) return;
+    const segments = this.pending.splice(0);
+    this.publish(this.sessionId, 'draw', segments);
+  }
+  paint([x, y, endX, endY, color]) {
+    const canvas = this.canvas;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = ctx.strokeStyle = color;
+    ctx.lineWidth = 3 * devicePixelRatio;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (x === endX && y === endY) {
+      ctx.arc(x * canvas.width, y * canvas.height, ctx.lineWidth / 2, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.moveTo(x * canvas.width, y * canvas.height);
+      ctx.lineTo(endX * canvas.width, endY * canvas.height);
+      ctx.stroke();
+    }
+  }
+  render() {
+    if (pictures) {
+      const index = this.model.photo;
+      const entry = this.model.uploads?.[index - photos.length];
+      const key = entry?.id ?? index;
+      if (this.displayedPhoto !== key) {
+        this.displayedPhoto = key;
+        if (this.imageUrl) URL.revokeObjectURL(this.imageUrl);
+        this.imageUrl = undefined;
+        if (entry) {
+          this.image.removeAttribute('src');
+          this.image.alt = entry.name;
+          this.showUploadedPhoto(entry);
+        } else {
+          const [file, description] = photos[index];
+          this.image.src = 'https://www.hellojevans.com/assets/' + file;
+          this.image.alt = description;
+        }
+      }
+      if (!this.uploading) status.textContent =
+        `${index + 1} / ${photos.length + (this.model.uploads?.length ?? 0)} · Shared live`;
+      return;
+    }
+    const canvas = this.canvas;
+    canvas.width = Math.max(1, Math.round(stage.clientWidth * devicePixelRatio));
+    canvas.height = Math.max(1, Math.round(stage.clientHeight * devicePixelRatio));
+    this.model.segments.forEach(segment => this.paint(segment));
+    this.pending.forEach(segment => this.paint(segment));
+  }
+  detach() {
+    this.cleanup.abort();
+    if (this.imageUrl) URL.revokeObjectURL(this.imageUrl);
+    clearInterval(this.timer);
+    this.observer?.disconnect();
+    super.detach();
+  }
+}
+
+if (!room || !/^[\w-]{1,100}$/.test(room)) {
+  status.textContent = 'Open this tool from a Greenlight room.';
+} else {
+  Croquet.Session.join({
+    box: '/',
+    appId: pictures ? 'com.hellojevans.greenlight.pictures' : 'com.hellojevans.greenlight.whiteboard',
+    name: room,
+    password: room,
+    model: ToolModel,
+    view: ToolView,
+    tps: 20
+  }).catch(error => {
+    status.textContent = 'Could not connect. Reopen this tool to retry.';
+    console.error(error);
+  });
+}
+</script>
+</html>
