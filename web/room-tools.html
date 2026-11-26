@@ -126,28 +126,32 @@ class ToolView extends Croquet.View {
   async uploadPictures(files) {
     if (this.uploading) return;
     this.uploading = true;
-    let skipped = 0;
+    let rejected = 0;
+    let failed = 0;
     for (const file of files) {
       if (!imageTypes.includes(file.type) || !file.size || file.size > maxImageBytes) {
-        skipped++;
+        rejected++;
         continue;
       }
       status.textContent = 'Adding pictures…';
       try {
-        const bytes = new Uint8Array(await file.arrayBuffer());
+        const bytes = await file.arrayBuffer();
         const handle = await Croquet.Data.store(this.sessionId, bytes);
         if (this.cleanup.signal.aborted) return;
         this.publish(this.sessionId, 'add-photo', {
           id: Croquet.Data.toId(handle), type: file.type, name: file.name.slice(0, 120)
         });
       } catch (error) {
-        skipped++;
+        failed++;
         console.error('Could not add picture', error);
       }
     }
     this.uploading = false;
     this.render();
-    if (skipped) status.textContent = `${skipped} skipped. Use an image up to 10 MB.`;
+    const messages = [];
+    if (rejected) messages.push(`${rejected} invalid file(s). Use PNG, JPEG, WebP, GIF or AVIF up to 10 MB.`);
+    if (failed) messages.push(`${failed} upload(s) failed. Try again.`);
+    if (messages.length) status.textContent = messages.join(' ');
   }
   async showUploadedPhoto(entry) {
     try {
